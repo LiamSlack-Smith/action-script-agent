@@ -6,25 +6,24 @@ from src.core.llm_interface import LLMInterface
 class ExecutionAgent:
     def __init__(self, llm_interface: LLMInterface):
         self.llm_interface = llm_interface
-    def generate_action_script(self, system_prompt: str):
+    def generate_action_script(self, messages: list[dict]):
         """
         Generates the Action Script by streaming the response from the LLM.
 
         Args:
-            system_prompt: The fully constructed system prompt.
+            messages: The full conversational history including few-shot examples.
 
         Yields:
             str: A stream of tokens representing the Action Script.
         """
-        print("--- EXECUTION AGENT: GENERATING SCRIPT ---")
-        print(system_prompt)
-        print("---------------------------------------------")
+        print("--- EXECUTION AGENT: GENERATING SCRIPT (with few-shot examples) ---")
+        # The last message is the current prompt, which is very long. We'll just print a confirmation.
+        # print(messages[-1]['content'])
+        print("---------------------------------------------------------------------")
 
-        # The linter will attach to this stream
-        # Gemini API does not support the 'system' role. We use the 'user' role instead.
         response_stream = self.llm_interface.get_completion_stream(
-            messages=[{"role": "user", "content": system_prompt}],
-            model="gemini/gemini-2.5-flash-lite"
+            messages=messages,
+            model="gemini/gemini-2.5-flash"
         )
         for part in response_stream:
             if content := part.choices[0].delta.content:

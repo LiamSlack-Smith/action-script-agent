@@ -1,7 +1,7 @@
 """
 Global State: Session-specific short-term working memory.
 """
-import pprint
+import json, pprint
 
 class GlobalState:
     def __init__(self):
@@ -21,9 +21,8 @@ class GlobalState:
             del self._state[key]
             return True
         return False
-
     def get_pretty_string(self) -> str:
-        """Returns a pretty-printed string representation of the state."""
+        """Returns a pretty-printed JSON string of the state."""
         if not self._state:
-            return "{}\n# The global_state is currently empty."
-        return pprint.pformat(self._state, indent=2)
+            return "# The global_state is currently empty."
+        return json.dumps(self._state, indent=4)

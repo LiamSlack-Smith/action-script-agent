@@ -4,6 +4,7 @@ Placeholder for user-defined and system tools.
 import inspect, os
 from typing import List
 from src.tools import core_functions
+from src.tools.ast_tools import find_function_definitions, find_class_definitions, find_imports
 def search_web(query: str) -> dict:
     """Searches the web for a given query and returns the top results.
 
@@ -28,11 +29,15 @@ def search_web(query: str) -> dict:
         ]
     }
 def load_tools() -> dict:
-    """Returns a dictionary of all available tools."""
+    """Loads all available tools."""
     return {
-        "search_web": search_web,
         "read_files": read_files,
         "write_file": write_file,
+        "list_files": list_files,
+        "search_web": search_web,
+        "find_function_definitions": find_function_definitions,
+        "find_class_definitions": find_class_definitions,
+        "find_imports": find_imports,
     }
 def get_tool_signatures(tools: dict) -> str:
     """

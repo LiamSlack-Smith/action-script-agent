@@ -12,8 +12,8 @@ from src.core.llm_interface import LLMInterface
 from src.data_stores.global_state import GlobalState
 from src.data_stores.vector_db import VectorDB
 from src.tools import core_functions
-from src.core.action_script_execution_environment import ActionScriptExecutionEnvironment, ScriptExecutionError
 from src.tools.tool_definitions import load_tools, get_tool_signatures, load_core_tools_for_prompt
+from src.core.action_script_execution_environment import ActionScriptExecutionEnvironment, ScriptExecutionError
 
 class AgentController:
     def __init__(self):
@@ -25,6 +25,7 @@ class AgentController:
         self.execution_agent = ExecutionAgent(self.llm_interface)
         self.memory_consolidation_agent = MemoryConsolidationAgent(self.llm_interface, self.vector_db)
         
+        # Restore full tool loading for prompt consistency
         self.tools = load_tools()
         core_tools_for_prompt = load_core_tools_for_prompt()
         all_tools_for_prompt = {**self.tools, **core_tools_for_prompt}
@@ -33,14 +34,14 @@ class AgentController:
         core_funcs_map = self._get_core_functions()
         
         self.linter = IncrementalLinter(allowed_functions=list(all_tools_for_prompt.keys()))
-        
         self.execution_environment = ActionScriptExecutionEnvironment(self.global_state, self.tools, core_funcs_map)
         
         self.conversation_id = str(uuid.uuid4())
         self.conversation_history = ""
+        # Restore few-shot examples
+        self.few_shot_examples = self._get_few_shot_examples()
 
         self._inject_initial_state()
-        print(f"--- NEW SESSION STARTED: {self.conversation_id} ---")
 
     def _get_core_functions(self):
         "Binds instance methods to the core function definitions." 
@@ -58,27 +59,22 @@ class AgentController:
         return f"""# System Instructions
 Your task is to act as an autonomous agent. Your primary goal is to address the user's request by generating a Python script (called an Action Script).
 
-# Reasoning Process
-1.  **Analyze Context**: First, carefully review the `Long-Term Memories` and `Current State` sections.
-2.  **Check for Existing Answers**: If the information needed is already present, respond directly. Do not use tools if you already know the answer.
-3.  **Assess Complexity**: Determine if the user's request is simple (can be solved in one step) or complex (requires multiple steps, like reading a file, modifying it, and then writing it).
-4.  **Formulate a Plan**: 
-    *   For **simple** tasks, outline your single step in the `reflect()` block and execute it.
-    *   For **complex** tasks, create a step-by-step plan in your `reflect()` block. **Execute only the first step of your plan**, and then end your script with `continue_turn()`. This allows you to see the result of the first step in the `Current State` on your next turn before proceeding.
-
 # Rules
 1.  Your response MUST be ONLY a Python script. Do not add any commentary, explanations, or markdown formatting.
-2.  **CRITICAL RULE**: You MUST end every script with a call to `respond(response: str)` or `continue_turn()`.
-3.  Use `reflect(analysis: str)` at the start of your script to explain your plan.
-4.  Do not use any Python features that are not provided (e.g., `import`).
+2.  The script must end by calling either `respond(response: str)` to give the final answer to the user, or `continue_turn()` to continue the thought process in the next turn.
+3.  You can use the `reflect(analysis: str)` function at the start of your script to analyze the situation and plan your steps.
+4.  When using the `write_file` tool, you MUST use triple quotes (\"\"\") for the `file_content` argument to prevent syntax errors with nested quotes.
+5.  Do not use any Python features that are not provided (e.g., `import`, defining classes, etc.). Only call the provided tools and core functions.
 
 # User Query
 {user_query}
 
 # Long-Term Memories
+Here are some memories from past interactions that might be relevant:
 {memories_str}
 
 # Current State (Short-Term Memory)
+This dictionary contains the results of all tools executed in the current session. It is read-only from your script's perspective.
 {state_str}
 
 # Available Tools
@@ -86,74 +82,77 @@ Your task is to act as an autonomous agent. Your primary goal is to address the 
 
 # Your Action Script:
 """
-    def run(self, user_query: str):
+    def run(self, initial_query: str):
+        print(f"--- NEW SESSION: {self.conversation_id} ---")
+        
+        retrieved_memories = self.memory_retrieval_agent.retrieve_memories(initial_query)
+        system_prompt = self._construct_system_prompt(initial_query, retrieved_memories)
+        
+        # Restore few-shot examples to the message history
+        messages = self.few_shot_examples + [{"role": "user", "content": system_prompt}]
+
         turn_in_progress = True
         while turn_in_progress:
-            # 1. Memory Retrieval & Prompt Construction
-            retrieved_memories = self.memory_retrieval_agent.retrieve_memories(user_query)
-            system_prompt = self._construct_system_prompt(user_query, retrieved_memories)
-            
-            # 2. Correction Loop (Generation + Validation + Execution)
             correction_attempts = 0
             max_correction_attempts = 3
             
             while correction_attempts < max_correction_attempts:
                 action_script = ""
                 try:
-                    # 3a. Action Script Generation & Validation
-                    script_stream = self.execution_agent.generate_action_script(system_prompt)
-                    validated_stream = self.linter.validate_stream(script_stream)
+                    script_stream = self.execution_agent.generate_action_script(messages)
                     
-                    # 3b. Stream output to terminal
                     print("--- AGENT STREAMING SCRIPT ---")
                     action_script_parts = []
+                    validated_stream = self.linter.validate_stream(script_stream)
                     for token in validated_stream:
                         print(token, end="", flush=True)
                         action_script_parts.append(token)
                     action_script = "".join(action_script_parts)
                     print("\n-------------------------------")
 
-                    # 4. Script Execution
+                    messages.append({"role": "assistant", "content": action_script})
+
                     self.execution_environment.execute_script(action_script)
                     
-                    raise ScriptExecutionError("Script completed without calling respond() or continue_turn(). You must end every script with one of these functions.")
+                    messages.pop()
+                    raise ScriptExecutionError("Script completed without calling respond() or continue_turn().")
 
                 except LinterError as e:
                     correction_attempts += 1
                     print(f"\n--- LINTER ERROR (Attempt {correction_attempts}) ---")
-                    print(f"Error: {e}")
-                    print(f"Faulty Code:\n{e.code}")
-                    print("---------------------------------")
-                    system_prompt += f"\n# Previous Attempt Failed (Linter)\nYour last script failed with a syntax or validation error: {e}. The faulty code was:\n```python\n{e.code}```\nPlease provide a corrected script."
+                    # Error handling logic here...
+                    messages.append({"role": "user", "content": f"Your last script failed with a syntax error: {e}. Please provide a corrected script."})
                     continue
                 
                 except ScriptExecutionError as e:
                     correction_attempts += 1
+                    if messages and messages[-1]["role"] == "assistant":
+                        messages.pop()
                     print(f"\n--- SCRIPT EXECUTION ERROR (Attempt {correction_attempts}) ---")
-                    print(f"Error: {e}")
-                    print(f"Faulty Script:\n{action_script}")
-                    print("---------------------------------")
-                    system_prompt += f"\n# Previous Attempt Failed (Execution)\nYour last script failed during execution with the error: {e}. The full script was:\n```python\n{action_script}```\nPlease analyze the error and the script, and provide a corrected version."
+                    # Error handling logic here...
+                    messages.append({"role": "user", "content": f"Your last script failed during execution: {e}. Please analyze the error and provide a corrected script."})
                     continue
 
                 except core_functions.RespondException as e:
                     print(f"--- FINAL RESPONSE TO USER ---\n{e.message}\n------------------------------")
-                    self.conversation_history += f"User: {user_query}\nAgent: {e.message}"
+                    self.conversation_history += f"User: {initial_query}\nAgent: {e.message}"
                     self.memory_consolidation_agent.consolidate_memory(self.conversation_history, self.conversation_id)
                     turn_in_progress = False
                     break
 
                 except core_functions.ContinueTurnException:
                     print("--- CONTINUING TURN ---")
-                    self.conversation_history += f"User: {user_query}\nAgent: [Internal State Update]"
-                    break 
+                    self.conversation_history += f"User: {initial_query}\nAgent: [Internal State Update]"
+                    retrieved_memories = self.memory_retrieval_agent.retrieve_memories(initial_query)
+                    system_prompt = self._construct_system_prompt(initial_query, retrieved_memories)
+                    messages.append({"role": "user", "content": system_prompt})
+                    break
             
             if correction_attempts >= max_correction_attempts:
                 print("Max correction attempts reached. Aborting.")
                 turn_in_progress = False
     def _inject_initial_state(self):
         """Injects initial, helpful information into the global state."""
-        # Inject the project file list
         project_files = []
         ignore_dirs = {'.git', '__pycache__', '.idea', '.vscode'}
         for root, dirs, files in os.walk('.'):
@@ -171,20 +170,35 @@ Your task is to act as an autonomous agent. Your primary goal is to address the 
                 }
             }
         )
+    def _get_few_shot_examples(self) -> list[dict]:
+        """Returns a list of few-shot examples for the agent."""
+        return [
+            {
+                "role": "user",
+                "content": "Your task is to find out the current weather in London."
+            },
+            {
+                "role": "assistant",
+                "content": "reflect(\"The user wants the weather in London. I will use the `search_web` tool for this and respond directly.\")\nsearch_web(query=\"current weather in London\")\nrespond(\"The weather in London is currently sunny with a high of 22C.\")"
+            },
+            {
+                "role": "user",
+                "content": "Your task is to read the `README.md` file and then write a summary of it to a new file called `summary.txt`."
+            },
+            {
+                "role": "assistant",
+                "content": "reflect(\"This is a complex, multi-step task. First, I need to read the `README.md` file. Then, in the next turn, I will process its content and write the summary. Step 1: Read the file.\")\nread_files(relative_file_paths=[\"README.md\"])\ncontinue_turn()"
+            },
+            {
+                "role": "user",
+                "content": "Your task is to create a file named `hello.txt` with the content `Hello, World!`."
+            },
+            {
+                "role": "assistant",
+                "content": "reflect(\"The user wants to create a new file with specific content. I will use the `write_file` tool. To avoid issues with quotes inside the content, I will use triple quotes for the `file_content` argument.\")\nwrite_file(relative_file_path=\"hello.txt\", file_content=\"\"\"Hello, World!\"\"\")\nrespond(\"I have successfully created the file `hello.txt`.\")"
+            }
+        ]
 
 if __name__ == "__main__":
     controller = AgentController()
-    controller.run("Use the web search tool to find out what the capital of France is, then respond with the answer.")
-if __name__ == "__main__":
-    controller = AgentController()
-    while True:
-        try:
-            user_input = input("\nEnter your command (or 'exit' to quit): ")
-            if user_input.lower() in ["exit", "quit"]:
-                print("Exiting session. Goodbye!")
-                break
-            if user_input:
-                controller.run(user_input)
-        except KeyboardInterrupt:
-            print("\nExiting session. Goodbye!")
-            break
+    controller.run("Summarise the current project.")
